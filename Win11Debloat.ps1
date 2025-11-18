@@ -48,6 +48,67 @@ param (
 )
 
 
+function Get-AppEntryInfo {
+    param (
+        [string]$Line
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    $cleanLine = $Line.Trim()
+    $isDefaultSelected = $true
+
+    if ($cleanLine.StartsWith('#')) {
+        $cleanLine = $cleanLine.TrimStart('#').Trim()
+        $isDefaultSelected = $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($cleanLine)) {
+        return $null
+    }
+
+    $lineWithoutComment = $cleanLine.Split('#')[0].Trim()
+
+    if (-not $lineWithoutComment) {
+        return $null
+    }
+
+    $pattern = $lineWithoutComment.Split([char[]]@(' '), 2)[0].Trim()
+
+    if (-not $pattern) {
+        return $null
+    }
+
+    $displayName = $pattern.Trim('*')
+
+    if (-not $displayName) {
+        return $null
+    }
+
+    return [PSCustomObject]@{
+        Pattern           = $pattern
+        DisplayName       = $displayName
+        IsDefaultSelected = $isDefaultSelected
+    }
+}
+
+function Remove-AppPackages {
+    param (
+        [Parameter(Mandatory = $true)][string]$PackagePattern
+    )
+
+    Get-AppxPackage -Name $PackagePattern -AllUsers | Remove-AppxPackage
+
+    Get-AppxProvisionedPackage -Online |
+        Where-Object { $_.PackageName -like $PackagePattern } |
+        ForEach-Object { Remove-ProvisionedAppxPackage -Online -AllUsers -PackageName $_.PackageName }
+}
+
+$script:InstalledAppCache = $null
+
+
 # Shows application selection form that allows the user to select what apps they want to remove or keep
 function ShowAppSelectionForm {
     [reflection.assembly]::loadwithpartialname("System.Windows.Forms") | Out-Null
@@ -99,43 +160,31 @@ function ShowAppSelectionForm {
         # Set filePath where Appslist can be found
         $appsFile = "$PSScriptRoot/Appslist.txt"
 
-        # Go through appslist and add items one by one to the selectionBox
-        Foreach ($app in (Get-Content -Path $appsFile | Where-Object { $_ -notmatch '^\s*$' } )) { 
-            $appChecked = $true
-
-            # Remove first # if it exists and set AppChecked to false
-            if ($app.StartsWith('#')) {
-                $app = $app.TrimStart("#")
-                $appChecked = $false
-            }
-            # Remove any comments from the Appname
-            if (-not ($app.IndexOf('#') -eq -1)) {
-                $app = $app.Substring(0, $app.IndexOf('#'))
-            }
-            # Remove any remaining spaces from the Appname
-            if (-not ($app.IndexOf(' ') -eq -1)) {
-                $app = $app.Substring(0, $app.IndexOf(' '))
-            }
-
-            $appString = $app.Trim('*')
-
-            # Make sure appString is not empty
-            if ($appString.length -gt 0) {
-                if($onlyInstalledCheckBox.Checked) {
-                    # onlyInstalledCheckBox is checked, check if app is installed before adding to selectionBox
-                    $installed = Get-AppxPackage -Name $app
-
-                    if($installed.length -eq 0) {
-                        # App is not installed, continue to next item without adding this app to the selectionBox
-                        continue
-                    }
-                }
-
-                # Add the app to the selectionBox and set it's checked status
-                $selectionBox.Items.Add($appString, $appChecked) | Out-Null
-            }
+        if($onlyInstalledCheckBox.Checked -and -not $script:InstalledAppCache) {
+            $script:InstalledAppCache = Get-AppxPackage | Select-Object -ExpandProperty Name
         }
-        
+
+        $installedPackages = @()
+        if($onlyInstalledCheckBox.Checked) {
+            $installedPackages = $script:InstalledAppCache
+        }
+
+        # Go through appslist and add items one by one to the selectionBox
+        Foreach ($line in (Get-Content -Path $appsFile)) {
+            $entry = Get-AppEntryInfo -Line $line
+
+            if(-not $entry) {
+                continue
+            }
+
+            if($onlyInstalledCheckBox.Checked -and -not ($installedPackages -like $entry.Pattern)) {
+                continue
+            }
+
+            # Add the app to the selectionBox and set it's checked status
+            $selectionBox.Items.Add($entry.DisplayName, $entry.IsDefaultSelected) | Out-Null
+        }
+
         # Hide loading indicator
         $loadingLabel.Visible = $false
 
@@ -229,27 +278,20 @@ function RemoveApps {
     Write-Output $message
 
     # Get list of apps from file at the path provided, and remove them one by one
-    Foreach ($app in (Get-Content -Path $appsFile | Where-Object { $_ -notmatch '^#.*' -and $_ -notmatch '^\s*$' } )) { 
-        # Remove any spaces before and after the Appname
-        $app = $app.Trim()
+    Foreach ($line in (Get-Content -Path $appsFile)) {
+        $entry = Get-AppEntryInfo -Line $line
 
-        # Remove any comments from the Appname
-        if (-not ($app.IndexOf('#') -eq -1)) {
-            $app = $app.Substring(0, $app.IndexOf('#'))
+        if(-not $entry) {
+            continue
         }
-        # Remove any remaining spaces from the Appname
-        if (-not ($app.IndexOf(' ') -eq -1)) {
-            $app = $app.Substring(0, $app.IndexOf(' '))
+
+        if(-not $entry.IsDefaultSelected) {
+            continue
         }
-        
-        $appString = $app.Trim('*')
-        Write-Output "Attempting to remove $appString..."
 
-        # Remove installed app for all existing users
-        Get-AppxPackage -Name $app -AllUsers | Remove-AppxPackage
+        Write-Output "Attempting to remove $($entry.DisplayName)..."
 
-        # Remove provisioned app from OS image, so the app won't be installed for any new users
-        Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $app } | ForEach-Object { Remove-ProvisionedAppxPackage -Online -AllUsers -PackageName $_.PackageName }
+        Remove-AppPackages -PackagePattern $entry.Pattern
     }
 
     Write-Output ""
@@ -262,16 +304,12 @@ function RemoveSpecificApps {
         $appslist
     )
 
-    Foreach ($app in $appsList) { 
+    Foreach ($app in $appsList) {
         Write-Output "Attempting to remove $app..."
 
-        $app = '*' + $app + '*'
+        $appPattern = '*' + $app + '*'
 
-        # Remove installed app for all existing users
-        Get-AppxPackage -Name $app -AllUsers | Remove-AppxPackage
-
-        # Remove provisioned app from OS image, so the app won't be installed for any new users
-        Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $app } | ForEach-Object { Remove-ProvisionedAppxPackage -Online -AllUsers -PackageName $_.PackageName }
+        Remove-AppPackages -PackagePattern $appPattern
     }
 }
 
